@@ -18,8 +18,8 @@ type FileProcessor struct {
 	eventHook    EventHook
 }
 
-// New creates a new FileProcessor with the given tracker and logger
-func New(tracker *assettracker.AssetTracker, logger *fileevent.Recorder) *FileProcessor {
+// NewFileProcessor creates a new FileProcessor with the given tracker and logger
+func NewFileProcessor(tracker *assettracker.AssetTracker, logger *fileevent.Recorder) *FileProcessor {
 	return &FileProcessor{
 		tracker: tracker,
 		logger:  logger,

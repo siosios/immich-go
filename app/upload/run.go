@@ -116,7 +116,7 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 		report := uc.app.FileProcessor().GenerateReport()
 		if len(report) > 0 {
 			if uc.app.UIExperimental {
-				uc.app.Log().Debug("asset tracking report", "report", strings.ReplaceAll(report, "\n", " | "))
+				uc.app.Log().Info("asset tracking report", "report", strings.ReplaceAll(report, "\n", " | "))
 			} else {
 				lines := strings.Split(report, "\n")
 				for _, s := range lines {
@@ -147,17 +147,7 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 			return fmt.Errorf("can't pause immich background jobs: pass an administrator key with the flag --admin-api-key or disable the jobs pausing with the flag --pause-immich-jobs=FALSE\n%w", err)
 		}
 	}
-	defer func() { _ = uc.finishing(ctx) }()
-	defer func() {
-		if uc.app.FileProcessor() != nil {
-			report := uc.app.FileProcessor().GenerateReport()
-			if uc.app.UIExperimental {
-				uc.app.Log().Info("asset tracking report", "report", strings.ReplaceAll(report, "\n", " | "))
-			} else {
-				fmt.Println(report)
-			}
-		}
-	}()
+
 	uc.albumsCache = cache.NewCollectionCache(50, func(album assets.Album, ids []string) (assets.Album, error) {
 		return uc.saveAlbum(ctx, album, ids)
 	})
@@ -186,6 +176,9 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 		}
 	}
 	err := runner(ctx, uc.app)
+	if err != nil {
+		err = uc.finishing(ctx)
+	}
 	return err
 }
 
@@ -502,9 +495,6 @@ func (uc *UpCmd) uploadAsset(ctx context.Context, a *assets.Asset) (string, file
 		uc.app.FileProcessor().RecordAssetProcessed(ctx, a.File, int64(a.FileSize), fileevent.ProcessedUploadSuccess)
 	}
 	a.ID = ar.ID
-
-	// // DEBGUG
-	//  if theID, ok := uc.assetIndex.byI
 
 	if a.FromApplication != nil && ar.Status != immich.StatusDuplicate {
 		// metadata from application (immich or google photos) are forced.

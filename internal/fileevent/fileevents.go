@@ -189,7 +189,7 @@ type Recorder struct {
 
 type counts []int64
 
-func NewRecorder(l *slog.Logger) *Recorder {
+func New(l *slog.Logger) *Recorder {
 	r := &Recorder{
 		counts:     make([]int64, MaxCode),
 		sizes:      make([]int64, MaxCode),

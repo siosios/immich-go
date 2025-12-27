@@ -56,22 +56,37 @@ func (s *uiSink) HandleEvent(ctx context.Context, code fileevent.Code, file stri
 		msg = fmt.Sprintf("%s file=%s", msg, file)
 	}
 
-	// Add args to message
+	details := map[string]string{
+		"event_code":    code.String(),
+		"event_code_id": fmt.Sprintf("%d", int(code)),
+	}
+	if file != "" {
+		details["file"] = file
+	}
+	if size > 0 {
+		details["size_bytes"] = fmt.Sprintf("%d", size)
+	}
+
+	// Add args to message and details
 	for k, v := range args {
 		if k == "error" || k == "warning" {
 			continue // Already handled in level determination
 		}
-		msg = fmt.Sprintf("%s %s=%v", msg, k, v)
+		sv := fmt.Sprintf("%v", v)
+		msg = fmt.Sprintf("%s %s=%s", msg, k, sv)
+		details[k] = sv
 	}
 
 	// If there's an error, append it
 	if errMsg, hasError := args["error"]; hasError {
 		msg = fmt.Sprintf("%s error=%v", msg, errMsg)
+		details["error"] = fmt.Sprintf("%v", errMsg)
 	}
 
 	s.publisher.AppendLog(s.ctx, state.LogEvent{
 		Level:     level,
 		Message:   msg,
 		Timestamp: time.Now(),
+		Details:   details,
 	})
 }

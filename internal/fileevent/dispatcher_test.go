@@ -271,7 +271,7 @@ func TestRecorderWithMultipleSinks(t *testing.T) {
 	// Create recorder with slog
 	var buf mockLogBuffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	recorder := NewRecorder(logger)
+	recorder := New(logger)
 
 	// Add mock sink
 	mock := &MockSink{}
@@ -307,7 +307,7 @@ func TestRecorderWithMultipleSinks(t *testing.T) {
 func TestRecorderSetLoggerUpdatesSink(t *testing.T) {
 	var buf1 mockLogBuffer
 	logger1 := slog.New(slog.NewTextHandler(&buf1, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	recorder := NewRecorder(logger1)
+	recorder := New(logger1)
 
 	ctx := context.Background()
 

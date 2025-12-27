@@ -15,6 +15,8 @@ import (
 	"github.com/simulot/immich-go/internal/filetypes"
 	"github.com/simulot/immich-go/internal/fshelper"
 	"github.com/simulot/immich-go/internal/ui/core/messages"
+	statssvc "github.com/simulot/immich-go/internal/ui/core/services/stats"
+	"github.com/simulot/immich-go/internal/ui/core/services/watchers"
 	"github.com/simulot/immich-go/internal/ui/core/state"
 	"github.com/simulot/immich-go/internal/ui/runner"
 )
@@ -23,6 +25,10 @@ func (uc *UpCmd) initUIPipeline(ctx context.Context) {
 	if uc.uiPublisher == nil {
 		uc.uiPublisher = messages.NoopPublisher{}
 	}
+
+	// Allow tests to capture stats even when UI is disabled.
+	testCapture := ctx.Value("test-stats-capture")
+	forceTestCapture := testCapture != nil
 
 	now := time.Now()
 	uc.uiStatsMu.Lock()
@@ -36,9 +42,9 @@ func (uc *UpCmd) initUIPipeline(ctx context.Context) {
 	uc.uiStatsPrevSample = now
 	statsSnapshot := state.CloneRunStats(uc.uiStats)
 	uc.uiStatsMu.Unlock()
-	uc.uiPublisher.UpdateStats(ctx, statsSnapshot)
 
-	if uc.NoUI || !uc.app.UIExperimental {
+	if !forceTestCapture && (uc.NoUI || !uc.app.UIExperimental) {
+		uc.uiPublisher.UpdateStats(ctx, statsSnapshot)
 		return
 	}
 
@@ -46,15 +52,41 @@ func (uc *UpCmd) initUIPipeline(ctx context.Context) {
 	if buffer <= 0 {
 		buffer = 1
 	}
+
+	// Create stats source as the single producer of stats events
+	uc.uiStatsSource = statssvc.NewSource(buffer, statsSnapshot, nil)
+	uc.uiBus = messages.NewEventBus(buffer)
+	_ = uc.uiBus.AddSource("stats", uc.uiStatsSource)
+	// Primary pipeline publisher + stream
 	publisher, stream := messages.NewChannelPublisher(buffer)
 	uc.uiPublisher = publisher
-	uc.uiPublisher.UpdateStats(ctx, uc.snapshotStats())
 
 	// Set up slog handler to forward logs to UI
 	uc.setupUILogHandler(ctx)
 
 	uiCtx, cancel := context.WithCancel(ctx)
 	uc.uiRunnerCancel = cancel
+
+	// Add pipeline stream to bus
+	if err := uc.uiBus.AddSource("pipeline", messages.NewChannelSource(stream, publisher.Close)); err != nil {
+		uc.app.Log().Debug("ui bus: add pipeline source failed", "err", err)
+	}
+
+	// Add watcher sources when available (jobs / inventory)
+	if uc.client.AdminImmich != nil {
+		js := watchers.NewJobsSource(uc.client.AdminImmich, uc.app.UIJobsPollInterval, uc.app.Log().Logger)
+		if err := uc.uiBus.AddSource("jobs", js); err != nil {
+			uc.app.Log().Debug("ui bus: add jobs source failed", "err", err)
+		}
+	}
+	if uc.client.Immich != nil {
+		is := watchers.NewInventorySource(uc.client.Immich, uc.app.UIInventoryPollInterval, uc.app.Log().Logger)
+		if err := uc.uiBus.AddSource("inventory", is); err != nil {
+			uc.app.Log().Debug("ui bus: add inventory source failed", "err", err)
+		}
+	}
+
+	// Fan-out from the merged bus stream
 	legacyStreamNeeded := !uc.NoUI && (!uc.app.UIExperimental || uc.app.UILegacy)
 	var sinks []chan messages.Event
 	var dumpStream chan messages.Event
@@ -62,6 +94,14 @@ func (uc *UpCmd) initUIPipeline(ctx context.Context) {
 		legacyChan := make(chan messages.Event, buffer)
 		uc.uiStream = legacyChan
 		sinks = append(sinks, legacyChan)
+
+		// Legacy adapter: keep old TUI working off the bus
+		if uc.app.UIExperimental {
+			adapter := messages.NewLegacyAdapter(uc.uiBus, legacyChan, func() { close(legacyChan) })
+			go adapter.Run(uiCtx)
+			// Adapter owns closing; avoid double-close in fan-out
+			sinks = sinks[:len(sinks)-1]
+		}
 	}
 	var runnerStream chan messages.Event
 	if uc.app.UIMode != runner.ModeOff {
@@ -72,27 +112,47 @@ func (uc *UpCmd) initUIPipeline(ctx context.Context) {
 		dumpStream = make(chan messages.Event, buffer)
 		sinks = append(sinks, dumpStream)
 	}
+	// Optional test sink: capture stats events for E2E assertions
+	if testCapture != nil {
+		testSink := make(chan messages.Event, buffer)
+		sinks = append(sinks, testSink)
+		go captureTestStats(uiCtx, testSink, testCapture)
+	}
 	if len(sinks) > 0 {
-		go fanOutEventStream(uiCtx, stream, sinks...)
+		go fanOutEventStream(uiCtx, uc.uiBus.Events(), sinks...)
 	} else {
-		go drainEventStream(uiCtx, stream)
+		go drainEventStream(uiCtx, uc.uiBus.Events())
 	}
 	if dumpStream != nil {
 		go logUIEvents(uiCtx, dumpStream, uc.app.Log().Logger)
 	}
 
 	if processor := uc.app.FileProcessor(); processor != nil {
-		processor.SetCountersHook(func(c assettracker.AssetCounters) {
-			uc.recordCountersSnapshot(c)
-		})
+		if uc.uiStatsSource != nil {
+			processor.SetCountersHook(func(c assettracker.AssetCounters) {
+				uc.uiStatsSource.ApplyCounters(c)
+			})
+		} else {
+			processor.SetCountersHook(func(c assettracker.AssetCounters) {
+				uc.recordCountersSnapshot(c)
+			})
+		}
+
 		processor.SetEventHook(func(evtCtx context.Context, code fileevent.Code, file fshelper.FSAndName, size int64, attrs map[string]string) {
 			uc.forwardProcessingEvent(evtCtx, code, file, size, attrs)
 		})
-		uc.startStatsAggregator(uiCtx)
-		uc.flushStatsFromCounters(ctx)
+
+		if uc.uiStatsSource != nil {
+			uc.uiStatsSource.ApplyCounters(processor.Tracker().GetCounters())
+		} else {
+			uc.startStatsAggregator(uiCtx)
+			uc.flushStatsFromCounters(ctx)
+		}
 	}
-	uc.startJobsWatcher(uiCtx)
-	uc.startInventoryWatcher(uiCtx)
+	if uc.uiBus == nil {
+		uc.startJobsWatcher(uiCtx)
+		uc.startInventoryWatcher(uiCtx)
+	}
 
 	if runnerStream != nil {
 		uc.uiWaitForUser = uc.app.UIExperimental && !uc.NoUI
@@ -153,7 +213,10 @@ func (uc *UpCmd) shutdownUIPipeline(ctx context.Context) {
 	uc.stopJobsWatcher()
 	uc.stopInventoryWatcher()
 	uc.cleanupUILogHandler()
-	if uc.uiPublisher != nil {
+	if uc.uiBus != nil {
+		uc.uiBus.Close()
+		uc.uiBus = nil
+	} else if uc.uiPublisher != nil {
 		uc.uiPublisher.Close()
 	}
 	if uc.uiRunnerCancel != nil {
@@ -212,9 +275,34 @@ func drainEventStream(ctx context.Context, source messages.Stream) {
 	}
 }
 
+// captureTestStats reads stats events from a channel and records them in a test StatsCapture.
+func captureTestStats(ctx context.Context, events <-chan messages.Event, capture interface{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-events:
+			if !ok {
+				return
+			}
+			if evt.Type != messages.EventStatsUpdated {
+				continue
+			}
+			if stats, ok := evt.Payload.(state.RunStats); ok {
+				// Capture implements Record(state.RunStats)
+				capture.(interface{ Record(state.RunStats) }).Record(stats)
+			}
+		}
+	}
+}
+
 func (uc *UpCmd) publishAssetQueued(ctx context.Context, a *assets.Asset, code fileevent.Code) {
 	event := uc.buildAssetEvent(a, state.AssetStageQueued, code, 0, "", nil)
 	uc.uiPublisher.AssetQueued(ctx, event)
+	if uc.uiStatsSource != nil {
+		uc.uiStatsSource.AssetQueued()
+		return
+	}
 	uc.updateStats(ctx, func(stats *state.RunStats) {
 		stats.Queued++
 	})
@@ -223,6 +311,10 @@ func (uc *UpCmd) publishAssetQueued(ctx context.Context, a *assets.Asset, code f
 func (uc *UpCmd) publishAssetUploaded(ctx context.Context, a *assets.Asset, code fileevent.Code, bytes int64, details map[string]string) {
 	event := uc.buildAssetEvent(a, state.AssetStageUploaded, code, bytes, "", details)
 	uc.uiPublisher.AssetUploaded(ctx, event)
+	if uc.uiStatsSource != nil {
+		uc.uiStatsSource.AssetUploaded(bytes)
+		return
+	}
 	uc.updateStats(ctx, func(stats *state.RunStats) {
 		stats.Uploaded++
 		stats.BytesSent += bytes
@@ -236,6 +328,10 @@ func (uc *UpCmd) publishAssetFailed(ctx context.Context, a *assets.Asset, code f
 	}
 	event := uc.buildAssetEvent(a, state.AssetStageFailed, code, 0, msg, details)
 	uc.uiPublisher.AssetFailed(ctx, event)
+	if uc.uiStatsSource != nil {
+		uc.uiStatsSource.AssetFailed()
+		return
+	}
 	uc.updateStats(ctx, func(stats *state.RunStats) {
 		stats.Failed++
 	})
@@ -278,17 +374,37 @@ func (uc *UpCmd) updateStats(ctx context.Context, mutate func(*state.RunStats)) 
 }
 
 func (uc *UpCmd) applyCountersSnapshot(ctx context.Context, counters assettracker.AssetCounters) {
+	if uc.uiStatsSource != nil {
+		uc.uiStatsSource.ApplyCounters(counters)
+		return
+	}
 	uc.updateStats(ctx, func(stats *state.RunStats) {
 		stats.Pending = int(counters.Pending)
 		stats.PendingBytes = counters.PendingSize
-		stats.Processed = int(counters.Processed)
-		stats.ProcessedBytes = counters.ProcessedSize
-		stats.Discarded = int(counters.Discarded)
-		stats.DiscardedBytes = counters.DiscardedSize
-		stats.ErrorCount = int(counters.Errors)
-		stats.ErrorBytes = counters.ErrorSize
-		stats.TotalDiscovered = int(counters.Total())
-		stats.TotalDiscoveredBytes = counters.AssetSize
+		if v := int(counters.Processed); v > stats.Processed {
+			stats.Processed = v
+		}
+		if v := counters.ProcessedSize; v > stats.ProcessedBytes {
+			stats.ProcessedBytes = v
+		}
+		if v := int(counters.Discarded); v > stats.Discarded {
+			stats.Discarded = v
+		}
+		if v := counters.DiscardedSize; v > stats.DiscardedBytes {
+			stats.DiscardedBytes = v
+		}
+		if v := int(counters.Errors); v > stats.ErrorCount {
+			stats.ErrorCount = v
+		}
+		if v := counters.ErrorSize; v > stats.ErrorBytes {
+			stats.ErrorBytes = v
+		}
+		if v := int(counters.Total()); v > stats.TotalDiscovered {
+			stats.TotalDiscovered = v
+		}
+		if v := counters.AssetSize; v > stats.TotalDiscoveredBytes {
+			stats.TotalDiscoveredBytes = v
+		}
 		stats.InFlight = stats.Pending
 	})
 }

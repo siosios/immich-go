@@ -16,7 +16,6 @@ import (
 	"github.com/simulot/immich-go/internal/assets"
 	"github.com/simulot/immich-go/internal/assettracker"
 	"github.com/simulot/immich-go/internal/fileevent"
-	"github.com/simulot/immich-go/internal/fileprocessor"
 	"github.com/simulot/immich-go/internal/ui/core/messages"
 	"github.com/simulot/immich-go/internal/ui/core/state"
 	"golang.org/x/sync/errgroup"
@@ -39,14 +38,15 @@ type uiPage struct {
 	// Discovery zone views for total row
 	discoveryViews map[string]*tview.TextView
 
-	// File processor reference for event sizes
-	fileProcessor *fileprocessor.FileProcessor
-
 	// Asset tracker reference for status updates
 	tracker *assettracker.AssetTracker
 
 	// server's activity history
 	serverActivity []float64
+
+	// Counters fed by streamed log events
+	logCounts map[fileevent.Code]int64
+	logSizes  map[fileevent.Code]int64
 
 	// detect when the server is idling
 	lastTimeServerActive atomic.Int64
@@ -133,41 +133,39 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 		}()
 	}
 
-	// force the ui to redraw counters
-	go func() {
-		tick := time.NewTicker(100 * time.Millisecond)
-		for {
-			select {
-			case <-ctx.Done():
-				tick.Stop()
-				return
-			case <-tick.C:
-				uiApp.QueueUpdateDraw(func() {
-					counts := app.FileProcessor().Logger().GetCounts()
-					sizes := app.FileProcessor().Logger().GetEventSizes()
-					for c := range ui.counts {
-						ui.getCountView(c, counts[c])
-						ui.updateSizeView(c, sizes[c])
-					}
-					// Update the processing status zone
-					ui.updateStatusZone()
-					if uc.Mode == UpModeGoogleTakeout {
-						ui.immichPrepare.SetMaxValue(int(app.FileProcessor().Logger().TotalAssets()))
-						// Calculate processed items for Google Takeout progress
+	if uc.uiStream == nil {
+		// Legacy fallback: periodically poll trackers when no event stream is available.
+		go func() {
+			tick := time.NewTicker(100 * time.Millisecond)
+			for {
+				select {
+				case <-ctx.Done():
+					tick.Stop()
+					return
+				case <-tick.C:
+					uiApp.QueueUpdateDraw(func() {
 						counts := app.FileProcessor().Logger().GetCounts()
-						processedGP := counts[fileevent.ProcessedAssociatedMetadata] +
-							counts[fileevent.ProcessedMissingMetadata]
-						ui.immichPrepare.SetValue(int(processedGP))
-
-						if preparationDone.Load() {
-							ui.immichUpload.SetMaxValue(int(app.FileProcessor().Logger().TotalAssets()))
+						sizes := app.FileProcessor().Logger().GetEventSizes()
+						for c := range ui.counts {
+							ui.getCountView(c, counts[c])
+							ui.updateSizeView(c, sizes[c])
 						}
-						// ui.immichUpload.SetValue(int(app.Jnl().TotalProcessed(uc.takeoutOptions.KeepJSONLess)))
-					}
-				})
+						ui.updateStatusZone()
+						if uc.Mode == UpModeGoogleTakeout {
+							ui.immichPrepare.SetMaxValue(int(app.FileProcessor().Logger().TotalAssets()))
+							counts := app.FileProcessor().Logger().GetCounts()
+							processedGP := counts[fileevent.ProcessedAssociatedMetadata] +
+								counts[fileevent.ProcessedMissingMetadata]
+							ui.immichPrepare.SetValue(int(processedGP))
+							if preparationDone.Load() {
+								ui.immichUpload.SetMaxValue(int(app.FileProcessor().Logger().TotalAssets()))
+							}
+						}
+					})
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// start the UI
 	uiGroup.Go(func() error {
@@ -274,8 +272,10 @@ func newModal(message string) tview.Primitive {
 
 func (uc *UpCmd) newUI(ctx context.Context, a *app.Application) *uiPage {
 	ui := &uiPage{
-		counts: map[fileevent.Code]*tview.TextView{},
-		sizes:  map[fileevent.Code]*tview.TextView{},
+		counts:    map[fileevent.Code]*tview.TextView{},
+		sizes:     map[fileevent.Code]*tview.TextView{},
+		logCounts: map[fileevent.Code]int64{},
+		logSizes:  map[fileevent.Code]int64{},
 	}
 
 	ui.screen = tview.NewGrid()
@@ -293,7 +293,6 @@ func (uc *UpCmd) newUI(ctx context.Context, a *app.Application) *uiPage {
 	// Set tracker reference for status updates
 	if a.FileProcessor() != nil {
 		ui.tracker = a.FileProcessor().Tracker()
-		ui.fileProcessor = a.FileProcessor()
 	}
 
 	canWatchJobs := false
@@ -520,6 +519,64 @@ func (ui *uiPage) addStatusCounter(g *tview.Grid, row int, countKey, sizeKey str
 	g.AddItem(sizeView, row, 3, 1, 1, 0, 0, false)
 }
 
+// applyStats updates counters based on streamed RunStats snapshots.
+func (ui *uiPage) applyStats(stats state.RunStats) {
+	if ui.statusViews == nil || ui.discoveryViews == nil {
+		return
+	}
+	ui.statusViews["pendingCount"].SetText(fmt.Sprintf("%6d", stats.Pending))
+	ui.statusViews["pendingSize"].SetText(ui.formatBytes(stats.PendingBytes))
+	ui.statusViews["uploadedCount"].SetText(fmt.Sprintf("%6d", stats.Processed))
+	ui.statusViews["uploadedSize"].SetText(ui.formatBytes(stats.ProcessedBytes))
+	ui.statusViews["discardedCount"].SetText(fmt.Sprintf("%6d", stats.Discarded))
+	ui.statusViews["discardedSize"].SetText(ui.formatBytes(stats.DiscardedBytes))
+	ui.statusViews["errorCount"].SetText(fmt.Sprintf("%6d", stats.ErrorCount))
+	ui.statusViews["errorSize"].SetText(ui.formatBytes(stats.ErrorBytes))
+
+	// Total discovered mirrors discovery zone summary.
+	ui.statusViews["totalCount"].SetText(fmt.Sprintf("%6d", stats.TotalDiscovered))
+	ui.statusViews["totalSize"].SetText(ui.formatBytes(stats.TotalDiscoveredBytes))
+
+	ui.discoveryViews["discoveredCount"].SetText(fmt.Sprintf("%6d", stats.TotalDiscovered))
+	ui.discoveryViews["discoveredSize"].SetText(ui.formatBytes(stats.TotalDiscoveredBytes))
+}
+
+// applyLogEventCounters increments discovery/processing counters from log events carrying event metadata.
+func (ui *uiPage) applyLogEventCounters(entry state.LogEvent) {
+	if entry.Details == nil {
+		return
+	}
+	codeID := entry.Details["event_code_id"]
+	if codeID == "" {
+		return
+	}
+	var codeInt int
+	_, err := fmt.Sscanf(codeID, "%d", &codeInt)
+	if err != nil {
+		return
+	}
+	code := fileevent.Code(codeInt)
+
+	ui.logCounts[code]++
+	if sizeStr, ok := entry.Details["size_bytes"]; ok {
+		var size int64
+		_, _ = fmt.Sscan(sizeStr, &size)
+		ui.logSizes[code] += size
+	}
+
+	if view, ok := ui.counts[code]; ok {
+		view.SetText(fmt.Sprintf("%6d", ui.logCounts[code]))
+	}
+	if sizeView, ok := ui.sizes[code]; ok {
+		size := ui.logSizes[code]
+		if size == 0 {
+			sizeView.SetText("0 B")
+		} else {
+			sizeView.SetText(ui.formatBytes(size))
+		}
+	}
+}
+
 // addDiscoveryCounter adds count and size views for discovery zone total
 func (ui *uiPage) addDiscoveryCounter(g *tview.Grid, row int, countKey, sizeKey string) {
 	countView := tview.NewTextView().SetText("0").SetTextAlign(tview.AlignRight)
@@ -615,6 +672,11 @@ func (uc *UpCmd) dispatchLegacyUIEvent(uiApp *tview.Application, ui *uiPage, evt
 		case messages.EventLogLine:
 			if entry, ok := evt.Payload.(state.LogEvent); ok {
 				ui.appendUILogEntry(entry)
+				ui.applyLogEventCounters(entry)
+			}
+		case messages.EventStatsUpdated:
+			if stats, ok := evt.Payload.(state.RunStats); ok {
+				ui.applyStats(stats)
 			}
 		case messages.EventJobsUpdated:
 			if summaries, ok := evt.Payload.([]state.JobSummary); ok {
